@@ -85,15 +85,17 @@
 // All state lives under a configurable prefix (default "durex/"):
 //
 //	durex/workflows/{workflow_id}/
-//	├── claim.json            # distributed lock / lease (overwritable)
-//	├── state.json            # workflow status, result, error
+//	├── claim.json            # distributed lock / lease (mutable)
+//	├── state.json            # workflow status: running/failed (mutable)
+//	├── result.json           # completed workflow result (write-once)
 //	└── steps/
 //	    ├── {step_name}.json  # write-once step result
 //	    └── ...
 //
-// The claim, state, and step results are separate objects so they can be written
-// independently without read-modify-write cycles. Step results are immutable
-// once written.
+// The claim, state, result, and step results are separate objects so they can be
+// written independently without read-modify-write cycles. Result and step objects
+// are immutable once written (PutIfAbsent). The state and claim objects are mutable
+// for operational updates (status changes, lease renewal).
 //
 // # Observability
 //

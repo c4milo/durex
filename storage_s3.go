@@ -77,15 +77,31 @@ func (s *S3Storage) Get(ctx context.Context, key string) ([]byte, error) {
 		Key:    &key,
 	})
 	if err != nil {
-		var nsk *types.NoSuchKey
-		var nf *types.NotFound
-		if errors.As(err, &nsk) || errors.As(err, &nf) {
+		if isS3NotFound(err) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 	defer out.Body.Close()
 	return io.ReadAll(out.Body)
+}
+
+// isS3NotFound checks all the ways S3 can signal "object does not exist":
+// typed errors (NoSuchKey, NotFound) and string error codes.
+func isS3NotFound(err error) bool {
+	var nsk *types.NoSuchKey
+	var nf *types.NotFound
+	if errors.As(err, &nsk) || errors.As(err, &nf) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound", "404":
+			return true
+		}
+	}
+	return false
 }
 
 func (s *S3Storage) List(ctx context.Context, prefix string) ([]string, error) {

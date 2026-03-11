@@ -15,10 +15,9 @@ import (
 // Workflow holds the execution context for a running workflow.
 // It is passed to the workflow function and used by [Step] to check and persist step results.
 type Workflow struct {
-	id         string
-	executor   *Executor
-	ctx        context.Context
-	fenceToken int64
+	id       string
+	executor *Executor
+	ctx      context.Context
 
 	mu          sync.Mutex
 	stepResults map[string]json.RawMessage
@@ -63,16 +62,12 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 	}()
 
 	// Fast path: if workflow already completed, return cached result.
-	// No claim needed — the result is immutable once written.
-	existing, err := e.loadWorkflowState(ctx, workflowID)
+	cached, result, err := checkCompleted[T](ctx, e, workflowID)
 	if err != nil {
-		return result, fmt.Errorf("loading workflow state: %w", err)
+		return result, err
 	}
-	if existing != nil && existing.Status == WorkflowCompleted {
+	if cached {
 		span.SetAttributes(attribute.Bool("durex.workflow.cached", true))
-		if err := json.Unmarshal(existing.Result, &result); err != nil {
-			return result, fmt.Errorf("deserializing cached workflow result: %w", err)
-		}
 		return result, nil
 	}
 
@@ -81,38 +76,36 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 	if err != nil {
 		return result, err
 	}
-	defer e.releaseClaim(ctx, workflowID)
+
+	// Use a context that survives cancellation for cleanup operations.
+	// If the caller cancels ctx, we still need to release the claim and
+	// save failure state — otherwise the claim is orphaned until lease expiry.
+	cleanupCtx := context.WithoutCancel(ctx)
+	defer e.releaseClaim(cleanupCtx, workflowID)
+
+	// Start background lease renewal so long-running workflows don't lose
+	// their claim. Renews at half the lease duration.
+	renewCtx, cancelRenew := context.WithCancel(cleanupCtx)
+	defer cancelRenew()
+	go e.renewLeaseLoop(renewCtx, workflowID)
 
 	span.SetAttributes(attribute.Int64("durex.workflow.fence_token", fenceToken))
 
-	// Load any previously completed step results for recovery.
-	stepResults, err := e.loadAllStepResults(ctx, workflowID)
+	// Re-check after claim to close the TOCTOU gap: another executor may
+	// have completed the workflow between our check and claim acquisition.
+	cached, result, err = checkCompleted[T](ctx, e, workflowID)
 	if err != nil {
-		return result, fmt.Errorf("loading step results: %w", err)
+		return result, err
+	}
+	if cached {
+		span.SetAttributes(attribute.Bool("durex.workflow.cached", true))
+		return result, nil
 	}
 
-	span.SetAttributes(attribute.Int("durex.workflow.recovered_steps", len(stepResults)))
-
-	// Mark workflow as running.
-	now := time.Now().UTC()
-	wfState := &WorkflowState{
-		ID:        workflowID,
-		Status:    WorkflowRunning,
-		StartedAt: now,
-	}
-	if existing != nil {
-		wfState.StartedAt = existing.StartedAt
-	}
-	if err := e.saveWorkflowState(ctx, wfState); err != nil {
-		return result, fmt.Errorf("saving workflow state: %w", err)
-	}
-
-	wf := &Workflow{
-		id:          workflowID,
-		executor:    e,
-		ctx:         ctx,
-		fenceToken:  fenceToken,
-		stepResults: stepResults,
+	// Prepare execution: load cached steps, mark workflow running.
+	wf, wfState, err := prepareExecution(ctx, e, workflowID, span)
+	if err != nil {
+		return result, err
 	}
 
 	// Execute the workflow function, catching panics.
@@ -124,7 +117,7 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 			wfState.Status = WorkflowFailed
 			wfState.CompletedAt = &completedAt
 			wfState.Error = err.Error()
-			_ = e.saveWorkflowState(ctx, wfState)
+			_ = e.saveWorkflowState(cleanupCtx, wfState)
 		}
 	}()
 
@@ -151,9 +144,70 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 	wfState.Status = WorkflowCompleted
 	wfState.Result = resultJSON
 	span.SetAttributes(attribute.String("durex.workflow.status", string(WorkflowCompleted)))
-	if err := e.saveWorkflowState(ctx, wfState); err != nil {
-		return result, fmt.Errorf("saving completed workflow state: %w", err)
+
+	// Write-once persist: first writer wins, same pattern as steps.
+	fencedResult, fenced, err := completeWorkflow[T](ctx, e, wfState)
+	if err != nil {
+		return result, fmt.Errorf("completing workflow: %w", err)
+	}
+	if fenced {
+		span.SetAttributes(attribute.Bool("durex.workflow.fenced", true))
+		return fencedResult, nil
 	}
 
 	return result, nil
+}
+
+// checkCompleted loads workflow state and returns the cached result if completed.
+func checkCompleted[T any](ctx context.Context, e *Executor, workflowID string) (bool, T, error) {
+	var zero T
+	existing, err := e.loadWorkflowState(ctx, workflowID)
+	if err != nil {
+		return false, zero, fmt.Errorf("loading workflow state: %w", err)
+	}
+	if existing == nil || existing.Status != WorkflowCompleted {
+		return false, zero, nil
+	}
+
+	var result T
+	if err := json.Unmarshal(existing.Result, &result); err != nil {
+		return false, zero, fmt.Errorf("deserializing cached workflow result: %w", err)
+	}
+	return true, result, nil
+}
+
+// prepareExecution loads cached step results, marks the workflow as running,
+// and returns a ready-to-use Workflow handle.
+func prepareExecution(ctx context.Context, e *Executor, workflowID string, span trace.Span) (*Workflow, *WorkflowState, error) {
+	existing, err := e.loadWorkflowState(ctx, workflowID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("loading workflow state: %w", err)
+	}
+
+	stepResults, err := e.loadAllStepResults(ctx, workflowID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("loading step results: %w", err)
+	}
+	span.SetAttributes(attribute.Int("durex.workflow.recovered_steps", len(stepResults)))
+
+	now := time.Now().UTC()
+	wfState := &WorkflowState{
+		ID:        workflowID,
+		Status:    WorkflowRunning,
+		StartedAt: now,
+	}
+	if existing != nil {
+		wfState.StartedAt = existing.StartedAt
+	}
+	if err := e.saveWorkflowState(ctx, wfState); err != nil {
+		return nil, nil, fmt.Errorf("saving workflow state: %w", err)
+	}
+
+	wf := &Workflow{
+		id:          workflowID,
+		executor:    e,
+		ctx:         ctx,
+		stepResults: stepResults,
+	}
+	return wf, wfState, nil
 }

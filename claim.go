@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -31,7 +30,7 @@ func (c *WorkflowClaim) isExpired() bool {
 }
 
 func (e *Executor) claimKey(workflowID string) string {
-	return path.Join(e.opts.Prefix, "workflows", workflowID, "claim.json")
+	return e.opts.Prefix + "workflows/" + workflowID + "/claim.json"
 }
 
 // acquireClaim attempts to acquire a distributed lock for the given workflow.
@@ -129,7 +128,73 @@ func (e *Executor) acquireClaim(ctx context.Context, workflowID string) (int64, 
 	return claim.FenceToken, nil
 }
 
+// renewClaim extends the lease on an existing claim owned by this executor.
+// Returns false if the claim no longer belongs to us (another executor took over).
+func (e *Executor) renewClaim(ctx context.Context, workflowID string) bool {
+	data, err := e.storage.Get(ctx, e.claimKey(workflowID))
+	if err != nil {
+		return false
+	}
+
+	var existing WorkflowClaim
+	if err := json.Unmarshal(data, &existing); err != nil {
+		return false
+	}
+
+	if existing.Owner != e.ownerID {
+		return false
+	}
+
+	existing.ClaimedAt = time.Now().UTC()
+	renewed, err := json.Marshal(existing)
+	if err != nil {
+		return false
+	}
+
+	return e.storage.Put(ctx, e.claimKey(workflowID), renewed) == nil
+}
+
+// renewLeaseLoop periodically renews the claim lease until ctx is cancelled.
+// It renews at half the lease duration to ensure the claim doesn't expire
+// while the workflow is still running.
+func (e *Executor) renewLeaseLoop(ctx context.Context, workflowID string) {
+	interval := e.opts.LeaseDuration / 2
+	if interval < time.Millisecond {
+		return // lease too short for renewal (e.g., tests with 1ns lease)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !e.renewClaim(ctx, workflowID) {
+				return // lost ownership
+			}
+		}
+	}
+}
+
 // releaseClaim removes the workflow claim, allowing future executions.
+// It only deletes the claim if this executor still owns it, to avoid
+// removing another executor's claim after a lease takeover.
 func (e *Executor) releaseClaim(ctx context.Context, workflowID string) {
+	data, err := e.storage.Get(ctx, e.claimKey(workflowID))
+	if err != nil {
+		return // claim already gone or unreadable — nothing to release
+	}
+
+	var claim WorkflowClaim
+	if err := json.Unmarshal(data, &claim); err != nil {
+		return
+	}
+
+	if claim.Owner != e.ownerID {
+		return // another executor took over — do not delete their claim
+	}
+
 	_ = e.storage.Delete(ctx, e.claimKey(workflowID))
 }
