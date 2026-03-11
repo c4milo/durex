@@ -1,0 +1,6 @@
+# TLA+ model checker output
+tla/states/
+*.toolbox
+
+# Binary
+tla/tla2tools.jar
