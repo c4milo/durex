@@ -1,5 +1,6 @@
 # TLA+ model checker output
 tla/states/
+tla/*_TTrace_*
 *.toolbox
 
 # Binary
