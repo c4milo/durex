@@ -57,9 +57,15 @@ func TestMemoryStorage_List(t *testing.T) {
 	s := NewMemoryStorage()
 	ctx := context.Background()
 
-	s.Put(ctx, "prefix/a", []byte("1"))
-	s.Put(ctx, "prefix/b", []byte("2"))
-	s.Put(ctx, "other/c", []byte("3"))
+	if err := s.Put(ctx, "prefix/a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "prefix/b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "other/c", []byte("3")); err != nil {
+		t.Fatal(err)
+	}
 
 	keys, err := s.List(ctx, "prefix/")
 	if err != nil {
@@ -74,7 +80,9 @@ func TestMemoryStorage_Delete(t *testing.T) {
 	s := NewMemoryStorage()
 	ctx := context.Background()
 
-	s.Put(ctx, "key1", []byte("v"))
+	if err := s.Put(ctx, "key1", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Delete(ctx, "key1"); err != nil {
 		t.Fatal(err)
 	}
@@ -93,8 +101,12 @@ func TestMemoryStorage_PutOverwrites(t *testing.T) {
 	s := NewMemoryStorage()
 	ctx := context.Background()
 
-	s.Put(ctx, "key1", []byte("v1"))
-	s.Put(ctx, "key1", []byte("v2"))
+	if err := s.Put(ctx, "key1", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "key1", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
 
 	data, _ := s.Get(ctx, "key1")
 	if string(data) != "v2" {

@@ -1,0 +1,84 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+
+  enable:
+    # Modernize Go code — suggests modern idioms and language features.
+    # Catches AI-generated code using pre-Go-1.21 patterns.
+    - modernize
+
+    # Cognitive complexity — flags functions too hard to understand.
+    - gocognit
+
+    # Finds naked returns in functions > threshold lines.
+    - nakedret
+
+    # Reports deeply nested if/else chains.
+    - nestif
+
+    # Finds duplicate code across the codebase.
+    - dupl
+
+    # Checks that errors are not compared with == but errors.Is/As.
+    - errorlint
+
+    # Finds force type assertions without checking ok.
+    - forcetypeassert
+
+    # Reports unnecessary conversions.
+    - unconvert
+
+    # Finds unused function parameters.
+    - unparam
+
+    # Checks that fmt.Errorf uses %w for wrapping.
+    - nilerr
+
+    # Reports reassignment of package-level vars.
+    - reassign
+
+    # Checks for misspelled words in comments.
+    - misspell
+
+    # Reports long lines.
+    - lll
+
+    # Ensures consistent test helper patterns.
+    - thelper
+
+    # Checks for unnecessary blank identifiers.
+    - wastedassign
+
+  settings:
+    gocognit:
+      min-complexity: 20
+
+    nestif:
+      min-complexity: 4
+
+    nakedret:
+      max-func-lines: 20
+
+    lll:
+      line-length: 140
+
+    dupl:
+      threshold: 120
+
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+      - common-false-positives
+    rules:
+      # Test files are allowed to be more relaxed.
+      - path: _test\.go
+        linters:
+          - dupl
+          - lll
+          - gocognit
+          - forcetypeassert

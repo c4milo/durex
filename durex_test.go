@@ -308,7 +308,9 @@ func TestStep_WriteOnceFencing(t *testing.T) {
 
 	// Simulate: another executor already wrote step "charge" for this workflow.
 	key := executor.stepKey("wf-fence", "charge")
-	storage.Put(ctx, key, mustMarshalStepState(t, "charge", "ch_first_writer"))
+	if err := storage.Put(ctx, key, mustMarshalStepState(t, "charge", "ch_first_writer")); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := RunWorkflow(ctx, executor, "wf-fence", func(wf *Workflow) (string, error) {
 		// This step's result is already cached from the pre-write above.
@@ -345,7 +347,7 @@ func TestStep_WriteOnceFencing_ConcurrentWrite(t *testing.T) {
 			executed.Store(true)
 
 			// Sneak in a write from "another executor" before our PutIfAbsent.
-			storage.PutIfAbsent(ctx, executor.stepKey("wf-fence2", "charge"),
+			_ = storage.PutIfAbsent(ctx, executor.stepKey("wf-fence2", "charge"),
 				mustMarshalStepState(t, "charge", "ch_other"))
 
 			return "ch_mine", nil

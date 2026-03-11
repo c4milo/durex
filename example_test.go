@@ -83,6 +83,13 @@ func createShippingLabel(ctx context.Context, address Address, weight float64) (
 // func(context.Context) (T, error).
 
 func processOrder(wf *durex.Workflow, order Order) (OrderResult, error) {
+	// wf.Context() carries the workflow's trace span and cancellation.
+	// wf.ID() returns the workflow identifier for logging/correlation.
+	if wf.Context().Err() != nil {
+		return OrderResult{}, wf.Context().Err()
+	}
+	_ = wf.ID() // available for logging: "processing order-abc"
+
 	// Step 1: validate the order (struct parameter).
 	valid, err := durex.Step(wf, "validate", func(ctx context.Context) (bool, error) {
 		return validateOrder(ctx, order)
