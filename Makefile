@@ -26,6 +26,8 @@ test:
 	go test -count=1 -race ./...
 
 # Run E2E tests against real S3.
-# Usage: AWS_PROFILE=your-profile DUREX_TEST_BUCKET=your-bucket make test-e2e
+# Loads .env.local if present, or override with env vars:
+#   AWS_PROFILE=your-profile DUREX_TEST_BUCKET=your-bucket make test-e2e
 test-e2e:
+	@if [ -f .env.local ]; then set -a && . ./.env.local && set +a; fi && \
 	go test -tags e2e -count=1 -race -v ./...

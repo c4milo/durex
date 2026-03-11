@@ -5,3 +5,6 @@ tla/*_TTrace_*
 
 # Binary
 tla/tla2tools.jar
+
+# Local environment (AWS credentials, etc.)
+.env.local
