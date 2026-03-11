@@ -135,6 +135,11 @@ func (e *Executor) loadAllStepResults(ctx context.Context, workflowID string) (m
 		return nil, err
 	}
 
+	if len(keys) > e.opts.MaxSteps {
+		return nil, fmt.Errorf("workflow %q has %d steps, exceeding limit of %d",
+			workflowID, len(keys), e.opts.MaxSteps)
+	}
+
 	results := make(map[string]json.RawMessage, len(keys))
 	for _, key := range keys {
 		data, err := e.storage.Get(ctx, key)

@@ -42,7 +42,7 @@ func (w *Workflow) Context() context.Context { return w.ctx }
 // The workflow ID must be unique per logical operation. Using the same ID ensures
 // exactly-once semantics across process restarts.
 func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn func(wf *Workflow) (T, error)) (result T, err error) {
-	if err := validateID(workflowID); err != nil {
+	if err := e.validateID(workflowID); err != nil {
 		return result, fmt.Errorf("invalid workflow ID: %w", err)
 	}
 
@@ -130,7 +130,7 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 		wfState.Status = WorkflowFailed
 		wfState.Error = err.Error()
 		span.SetAttributes(attribute.String("durex.workflow.status", string(WorkflowFailed)))
-		if saveErr := e.saveWorkflowState(ctx, wfState); saveErr != nil {
+		if saveErr := e.saveWorkflowState(cleanupCtx, wfState); saveErr != nil {
 			return result, fmt.Errorf("saving failed workflow state: %w (original error: %w)", saveErr, err)
 		}
 		return result, err
@@ -146,7 +146,7 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 	span.SetAttributes(attribute.String("durex.workflow.status", string(WorkflowCompleted)))
 
 	// Write-once persist: first writer wins, same pattern as steps.
-	fencedResult, fenced, err := completeWorkflow[T](ctx, e, wfState)
+	fencedResult, fenced, err := completeWorkflow[T](cleanupCtx, e, wfState)
 	if err != nil {
 		return result, fmt.Errorf("completing workflow: %w", err)
 	}

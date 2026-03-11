@@ -23,7 +23,7 @@ import (
 // Step names must be unique within a workflow. The result type T must be
 // JSON-serializable.
 func Step[T any](wf *Workflow, name string, fn func(ctx context.Context) (T, error)) (result T, err error) {
-	if err := validateID(name); err != nil {
+	if err := wf.executor.validateID(name); err != nil {
 		return result, fmt.Errorf("invalid step name: %w", err)
 	}
 

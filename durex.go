@@ -31,6 +31,12 @@ func New(storage ObjectStorage, opts Options) *Executor {
 	if opts.LeaseDuration == 0 {
 		opts.LeaseDuration = defaults.LeaseDuration
 	}
+	if opts.MaxSteps == 0 {
+		opts.MaxSteps = defaults.MaxSteps
+	}
+	if opts.MaxIDLength == 0 {
+		opts.MaxIDLength = defaults.MaxIDLength
+	}
 	return &Executor{
 		storage: storage,
 		opts:    opts,
@@ -38,18 +44,28 @@ func New(storage ObjectStorage, opts Options) *Executor {
 	}
 }
 
-// validateID checks that an identifier is safe for use as a storage key component.
-func validateID(id string) error {
+// validateID checks that an identifier is safe for use as a storage key
+// component. Only alphanumeric characters, hyphens, underscores, and dots
+// are allowed. This prevents log injection via control characters, S3 key
+// issues from special characters, and unbounded key lengths.
+func (e *Executor) validateID(id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: must not be empty", ErrInvalidID)
 	}
-	if strings.ContainsAny(id, "/\\") {
-		return fmt.Errorf("%w: must not contain path separators", ErrInvalidID)
+	if len(id) > e.opts.MaxIDLength {
+		return fmt.Errorf("%w: must not exceed %d characters", ErrInvalidID, e.opts.MaxIDLength)
 	}
-	if id == "." || id == ".." {
-		return fmt.Errorf("%w: must not be '.' or '..'", ErrInvalidID)
+	for _, c := range id {
+		if !isIDChar(c) {
+			return fmt.Errorf("%w: contains invalid character %q (allowed: a-z A-Z 0-9 . _ -)", ErrInvalidID, c)
+		}
 	}
 	return nil
+}
+
+func isIDChar(c rune) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
 }
 
 func newOwnerID() string {

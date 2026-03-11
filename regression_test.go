@@ -3,6 +3,8 @@ package durex
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -130,6 +132,111 @@ func TestRenewClaim(t *testing.T) {
 
 	if executor.renewClaim(ctx, "wf-renew") {
 		t.Fatal("renewClaim should fail when another executor owns the claim")
+	}
+}
+
+// S5: validateID rejects control characters, null bytes, and overly long IDs.
+func TestValidateID_Allowlist(t *testing.T) {
+	executor := New(NewMemoryStorage(), Options{})
+	ctx := context.Background()
+
+	// Valid IDs.
+	for _, id := range []string{"order-123", "step_a", "my.workflow", "ABC"} {
+		_, err := RunWorkflow(ctx, executor, id, func(wf *Workflow) (string, error) {
+			return "ok", nil
+		})
+		if err != nil {
+			t.Fatalf("valid ID %q rejected: %v", id, err)
+		}
+	}
+
+	// Invalid IDs: control chars, slashes, special chars.
+	for _, id := range []string{
+		"has/slash", "back\\slash", "null\x00byte", "newline\n",
+		"tab\there", "space here", "emoji😀", "colon:bad",
+	} {
+		_, err := RunWorkflow(ctx, executor, id, func(wf *Workflow) (string, error) {
+			return "ok", nil
+		})
+		if !errors.Is(err, ErrInvalidID) {
+			t.Fatalf("ID %q should be rejected, got: %v", id, err)
+		}
+	}
+}
+
+// S5: configurable MaxIDLength.
+func TestValidateID_MaxLength(t *testing.T) {
+	executor := New(NewMemoryStorage(), Options{MaxIDLength: 10})
+	ctx := context.Background()
+
+	// Exactly at limit — should work.
+	_, err := RunWorkflow(ctx, executor, "1234567890", func(wf *Workflow) (string, error) {
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("ID at max length rejected: %v", err)
+	}
+
+	// Over limit — should fail.
+	_, err = RunWorkflow(ctx, executor, "12345678901", func(wf *Workflow) (string, error) {
+		return "ok", nil
+	})
+	if !errors.Is(err, ErrInvalidID) {
+		t.Fatalf("ID over max length should be rejected, got: %v", err)
+	}
+}
+
+// S3: MaxSteps limits step loading during recovery.
+func TestMaxSteps_Enforced(t *testing.T) {
+	storage := NewMemoryStorage()
+	executor := New(storage, Options{MaxSteps: 2})
+	ctx := context.Background()
+
+	// Pre-write 3 step results to simulate a workflow with too many steps.
+	for _, name := range []string{"a", "b", "c"} {
+		key := executor.stepKey("wf-maxsteps", name)
+		data := mustMarshalStepState(t, name, "result-"+name)
+		if err := storage.Put(ctx, key, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Running the workflow should fail because 3 > MaxSteps(2).
+	_, err := RunWorkflow(ctx, executor, "wf-maxsteps", func(wf *Workflow) (string, error) {
+		return "ok", nil
+	})
+	if err == nil {
+		t.Fatal("expected error from MaxSteps limit")
+	}
+	if !strings.Contains(err.Error(), "exceeding limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// S6: completion persists even with cancelled context.
+func TestRunWorkflow_CompletionWithCancelledCtx(t *testing.T) {
+	storage := NewMemoryStorage()
+	executor := New(storage, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	result, err := RunWorkflow(ctx, executor, "wf-cancel-complete", func(wf *Workflow) (string, error) {
+		cancel() // cancel during workflow execution
+		return "completed-value", nil
+	})
+	if err != nil {
+		t.Fatalf("workflow should succeed despite cancelled ctx: %v", err)
+	}
+	if result != "completed-value" {
+		t.Fatalf("got %q, want %q", result, "completed-value")
+	}
+
+	// Result should be persisted (via cleanupCtx).
+	state, err := executor.loadWorkflowState(context.Background(), "wf-cancel-complete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.Status != WorkflowCompleted {
+		t.Fatalf("got status %v, want WorkflowCompleted", state)
 	}
 }
 

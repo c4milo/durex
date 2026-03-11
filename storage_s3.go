@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,12 +23,20 @@ type S3Config struct {
 
 	// UsePathStyle enables path-style addressing, required for MinIO and LocalStack.
 	UsePathStyle bool
+
+	// MaxObjectSize is the maximum size of an S3 object that will be read.
+	// Prevents OOM from maliciously large objects in the bucket.
+	// Default: 10 MB
+	MaxObjectSize int64
 }
+
+const defaultMaxObjectSize = 10 << 20 // 10 MB
 
 // S3Storage implements [ObjectStorage] using an S3-compatible backend.
 type S3Storage struct {
-	client *s3.Client
-	bucket string
+	client        *s3.Client
+	bucket        string
+	maxObjectSize int64
 }
 
 // NewS3Storage creates a new S3-backed storage.
@@ -35,7 +44,11 @@ func NewS3Storage(cfg S3Config) *S3Storage {
 	client := s3.NewFromConfig(cfg.Config, func(o *s3.Options) {
 		o.UsePathStyle = cfg.UsePathStyle
 	})
-	return &S3Storage{client: client, bucket: cfg.Bucket}
+	maxSize := cfg.MaxObjectSize
+	if maxSize == 0 {
+		maxSize = defaultMaxObjectSize
+	}
+	return &S3Storage{client: client, bucket: cfg.Bucket, maxObjectSize: maxSize}
 }
 
 func (s *S3Storage) Put(ctx context.Context, key string, data []byte) error {
@@ -83,7 +96,15 @@ func (s *S3Storage) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	limited := io.LimitReader(out.Body, s.maxObjectSize+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > s.maxObjectSize {
+		return nil, fmt.Errorf("object %q exceeds maximum size (%d bytes)", key, s.maxObjectSize)
+	}
+	return data, nil
 }
 
 // isS3NotFound checks all the ways S3 can signal "object does not exist":
