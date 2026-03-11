@@ -51,4 +51,7 @@ golangci-lint v2 with gocognit (max 20), no gocyclo. See `.golangci.yml`.
 Always explain **why** the change was made, not just what changed.
 
 ### Git workflow
-Always ask for approval before committing. Never force-push to main.
+- Always ask for approval before committing.
+- Never do destructive operations without explicit approval: push, force-push,
+  checkout (discards changes), branch deletion, file deletion, reset.
+- Never force-push to main.
