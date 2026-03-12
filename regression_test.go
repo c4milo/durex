@@ -240,6 +240,142 @@ func TestRunWorkflow_CompletionWithCancelledCtx(t *testing.T) {
 	}
 }
 
+// Hooks: lifecycle callbacks fire at the right time with correct data.
+func TestHooks_LifecycleCallbacks(t *testing.T) {
+	var (
+		started       bool
+		completedID   string
+		completedJSON json.RawMessage
+		stepNames     []string
+	)
+
+	storage := NewMemoryStorage()
+	executor := New(storage, Options{
+		Hooks: Hooks{
+			OnWorkflowStart: func(_ context.Context, id string) {
+				started = true
+			},
+			OnWorkflowComplete: func(_ context.Context, id string, result json.RawMessage) {
+				completedID = id
+				completedJSON = result
+			},
+			OnStepComplete: func(_ context.Context, _, stepName string, _ json.RawMessage) {
+				stepNames = append(stepNames, stepName)
+			},
+		},
+	})
+	ctx := context.Background()
+
+	result, err := RunWorkflow(ctx, executor, "wf-hooks", func(wf *Workflow) (string, error) {
+		_, err := Step(wf, "step-a", func(ctx context.Context) (string, error) {
+			return "a", nil
+		})
+		if err != nil {
+			return "", err
+		}
+		_, err = Step(wf, "step-b", func(ctx context.Context) (string, error) {
+			return "b", nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return "done", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "done" {
+		t.Fatalf("got %q, want %q", result, "done")
+	}
+	if !started {
+		t.Fatal("OnWorkflowStart was not called")
+	}
+	if completedID != "wf-hooks" {
+		t.Fatalf("OnWorkflowComplete ID = %q, want %q", completedID, "wf-hooks")
+	}
+	if string(completedJSON) != `"done"` {
+		t.Fatalf("OnWorkflowComplete result = %s, want %q", completedJSON, `"done"`)
+	}
+	if len(stepNames) != 2 || stepNames[0] != "step-a" || stepNames[1] != "step-b" {
+		t.Fatalf("OnStepComplete steps = %v, want [step-a step-b]", stepNames)
+	}
+}
+
+// Hooks: OnWorkflowFailed fires on error.
+func TestHooks_OnWorkflowFailed(t *testing.T) {
+	var failedErr error
+
+	storage := NewMemoryStorage()
+	executor := New(storage, Options{
+		Hooks: Hooks{
+			OnWorkflowFailed: func(_ context.Context, _ string, err error) {
+				failedErr = err
+			},
+		},
+	})
+	ctx := context.Background()
+
+	_, err := RunWorkflow(ctx, executor, "wf-hooks-fail", func(wf *Workflow) (string, error) {
+		return "", errors.New("intentional failure")
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if failedErr == nil {
+		t.Fatal("OnWorkflowFailed was not called")
+	}
+	if !strings.Contains(failedErr.Error(), "intentional failure") {
+		t.Fatalf("OnWorkflowFailed err = %v, want 'intentional failure'", failedErr)
+	}
+}
+
+// Hooks: OnStepComplete is NOT called for cached steps.
+func TestHooks_CachedStepsSkipHook(t *testing.T) {
+	var stepCount int
+
+	storage := NewMemoryStorage()
+	executor := New(storage, Options{
+		Hooks: Hooks{
+			OnStepComplete: func(_ context.Context, _, _ string, _ json.RawMessage) {
+				stepCount++
+			},
+		},
+	})
+	ctx := context.Background()
+
+	shouldFail := true
+	run := func() (string, error) {
+		return RunWorkflow(ctx, executor, "wf-hooks-cached", func(wf *Workflow) (string, error) {
+			_, err := Step(wf, "step-a", func(ctx context.Context) (string, error) {
+				return "a", nil
+			})
+			if err != nil {
+				return "", err
+			}
+			if shouldFail {
+				return "", errors.New("fail after step-a")
+			}
+			return "done", nil
+		})
+	}
+
+	// First run: step-a completes, workflow fails. Hook fires once.
+	_, _ = run()
+	if stepCount != 1 {
+		t.Fatalf("stepCount after first run = %d, want 1", stepCount)
+	}
+
+	// Second run: step-a is cached (hook should NOT fire), workflow succeeds.
+	shouldFail = false
+	_, err := run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stepCount != 1 {
+		t.Fatalf("stepCount after second run = %d, want 1 (cached step should not trigger hook)", stepCount)
+	}
+}
+
 // H5: key construction uses literal concatenation, not path.Join normalization.
 func TestKeyConstruction_NoNormalization(t *testing.T) {
 	executor := New(NewMemoryStorage(), Options{Prefix: "my-prefix/"})

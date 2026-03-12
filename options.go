@@ -1,6 +1,35 @@
 package durex
 
-import "time"
+import (
+	"context"
+	"encoding/json"
+	"time"
+)
+
+// Hooks provides lifecycle callbacks for workflow and step events.
+// All hooks are optional and best-effort — a hook failure does not affect
+// the workflow's durable state. Hooks fire after the durable write succeeds,
+// so the S3 source of truth is always consistent regardless of hook outcome.
+//
+// The context passed to hooks carries the active OpenTelemetry span, so any
+// work done inside a hook (database writes, notifications) appears as a child
+// span in the trace.
+type Hooks struct {
+	// OnWorkflowStart is called after the workflow claim is acquired and
+	// before the workflow function executes.
+	OnWorkflowStart func(ctx context.Context, id string)
+
+	// OnWorkflowComplete is called after the workflow result is durably
+	// persisted to S3. The result is the JSON-encoded return value.
+	OnWorkflowComplete func(ctx context.Context, id string, result json.RawMessage)
+
+	// OnWorkflowFailed is called after a failed workflow state is persisted.
+	OnWorkflowFailed func(ctx context.Context, id string, err error)
+
+	// OnStepComplete is called after a step result is durably persisted.
+	// It is NOT called for cached steps that were loaded from a previous run.
+	OnStepComplete func(ctx context.Context, workflowID, stepName string, result json.RawMessage)
+}
 
 // Options configures the durable executor.
 type Options struct {
@@ -29,6 +58,11 @@ type Options struct {
 	// Prevents unbounded S3 key lengths.
 	// Default: 256
 	MaxIDLength int
+
+	// Hooks provides lifecycle callbacks for building indexes, sending
+	// notifications, or integrating with external systems. All hooks are
+	// optional and best-effort.
+	Hooks Hooks
 }
 
 func defaultOptions() Options {

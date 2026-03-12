@@ -108,6 +108,8 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 		return result, err
 	}
 
+	e.fireWorkflowStart(ctx, workflowID)
+
 	// Execute the workflow function, catching panics.
 	defer func() {
 		if r := recover(); r != nil {
@@ -118,6 +120,7 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 			wfState.CompletedAt = &completedAt
 			wfState.Error = err.Error()
 			_ = e.saveWorkflowState(cleanupCtx, wfState)
+			e.fireWorkflowFailed(cleanupCtx, workflowID, err)
 		}
 	}()
 
@@ -133,6 +136,7 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 		if saveErr := e.saveWorkflowState(cleanupCtx, wfState); saveErr != nil {
 			return result, fmt.Errorf("saving failed workflow state: %w (original error: %w)", saveErr, err)
 		}
+		e.fireWorkflowFailed(cleanupCtx, workflowID, err)
 		return result, err
 	}
 
@@ -154,6 +158,8 @@ func RunWorkflow[T any](ctx context.Context, e *Executor, workflowID string, fn 
 		span.SetAttributes(attribute.Bool("durex.workflow.fenced", true))
 		return fencedResult, nil
 	}
+
+	e.fireWorkflowComplete(cleanupCtx, workflowID, resultJSON)
 
 	return result, nil
 }
@@ -210,4 +216,24 @@ func prepareExecution(ctx context.Context, e *Executor, workflowID string, span 
 		stepResults: stepResults,
 	}
 	return wf, wfState, nil
+}
+
+// Hook helpers — nil-safe, keep branching out of RunWorkflow.
+
+func (e *Executor) fireWorkflowStart(ctx context.Context, id string) {
+	if h := e.opts.Hooks.OnWorkflowStart; h != nil {
+		h(ctx, id)
+	}
+}
+
+func (e *Executor) fireWorkflowComplete(ctx context.Context, id string, result json.RawMessage) {
+	if h := e.opts.Hooks.OnWorkflowComplete; h != nil {
+		h(ctx, id, result)
+	}
+}
+
+func (e *Executor) fireWorkflowFailed(ctx context.Context, id string, err error) {
+	if h := e.opts.Hooks.OnWorkflowFailed; h != nil {
+		h(ctx, id, err)
+	}
 }

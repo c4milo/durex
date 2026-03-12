@@ -124,6 +124,10 @@ func Step[T any](wf *Workflow, name string, fn func(ctx context.Context) (T, err
 	wf.stepResults[name] = resultJSON
 	wf.mu.Unlock()
 
+	if h := wf.executor.opts.Hooks.OnStepComplete; h != nil {
+		h(ctx, wf.id, name, resultJSON)
+	}
+
 	return result, nil
 }
 
