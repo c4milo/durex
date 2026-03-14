@@ -11,10 +11,14 @@
 \* retries, and restarts.
 \*
 \* Safety properties verified:
-\*   ResultConsistency   - All completing executors agree on step results
-\*   StorageMatch        - Completed executors' caches match S3 storage
-\*   CompletionIntegrity - Completed executors have results for all steps
-\*   WriteOnceProperty   - Step results in S3 never change once written
+\*   ResultConsistency      - All completing executors agree on step results
+\*   StorageMatch           - Completed executors' caches match S3 storage
+\*   CompletionIntegrity    - Completed executors have results for all steps
+\*   WriteOnceProperty      - Step results in S3 never change once written
+\*   FencePositive          - Fence token is always >= 1 when a claim exists
+\*
+\* Liveness property (requires FairSpec):
+\*   EventualCompletion     - At least one executor eventually completes
 \*
 \* Deadlock freedom verified:
 \*   The system never reaches a state where no executor has completed and
@@ -100,15 +104,26 @@ ReadClaim(e) ==
                         IF leaseAlive THEN "rejected" ELSE "take_over"]
     /\ UNCHANGED <<claim, leaseAlive, stepStore, curStep, computed, cache, crashes>>
 
-\* Overwrite expired claim with bumped fence token.
-\* Uses plain Put (not PutIfAbsent) -- the claim must be replaceable.
-\* RACE: two executors may both detect expiry and both overwrite.
-\* Safety comes from write-once step results, not from this lock.
+\* CAS (compare-and-swap) on the expired claim via S3 conditional write
+\* (If-Match: <etag>). The executor bumps the fence token by one and
+\* overwrites the claim only if no other executor modified it since our
+\* ReadClaim. If the claim changed (another executor took over or
+\* released it), the CAS fails and we retry from idle.
+\*
+\* This guarantees strict fence token monotonicity: each successful
+\* TakeOver increments the fence by exactly 1 from the current value.
+\* Two concurrent TakeOver attempts cannot both succeed — the second
+\* one sees a different etag and fails.
 TakeOver(e) ==
     /\ pc[e] = "take_over"
-    /\ claim' = [owner |-> e, fence |-> readFence[e] + 1]
-    /\ leaseAlive' = TRUE
-    /\ pc' = [pc EXCEPT ![e] = "load_steps"]
+    /\ IF claim # NULL /\ claim.fence = readFence[e]
+       THEN \* CAS succeeds — claim unchanged since ReadClaim
+            /\ claim' = [owner |-> e, fence |-> readFence[e] + 1]
+            /\ leaseAlive' = TRUE
+            /\ pc' = [pc EXCEPT ![e] = "load_steps"]
+       ELSE \* CAS fails — claim was modified or released. Retry.
+            /\ pc' = [pc EXCEPT ![e] = "idle"]
+            /\ UNCHANGED <<claim, leaseAlive>>
     /\ UNCHANGED <<stepStore, curStep, computed, cache, readFence, crashes>>
 
 \* ================================================================
@@ -159,6 +174,27 @@ PersistStep(e) ==
             /\ pc' = [pc EXCEPT ![e] = "adopt_result"]
             /\ UNCHANGED <<stepStore, cache>>
     /\ UNCHANGED <<claim, leaseAlive, curStep, computed, readFence, crashes>>
+
+\* Models ambiguous PutIfAbsent response: the write succeeds on S3 but
+\* the executor crashes before seeing the acknowledgement. On restart,
+\* LoadSteps will read the persisted value from S3 and adopt it.
+\* This closes the gap where Crash alone (which fires before the write
+\* commits) does not model server-side success + client-side failure.
+PersistStepThenCrash(e) ==
+    /\ pc[e] = "persist_step"
+    /\ crashes[e] < MaxCrashes
+    /\ LET i == curStep[e] IN
+       IF stepStore[i] = NULL
+       THEN \* Write succeeds on S3, but executor crashes before seeing ACK
+            /\ stepStore' = [stepStore EXCEPT ![i] = computed[e]]
+            /\ pc' = [pc EXCEPT ![e] = "crashed"]
+            /\ crashes' = [crashes EXCEPT ![e] = crashes[e] + 1]
+            /\ UNCHANGED cache
+       ELSE \* Already written -- normal conflict, but executor also crashes
+            /\ pc' = [pc EXCEPT ![e] = "crashed"]
+            /\ crashes' = [crashes EXCEPT ![e] = crashes[e] + 1]
+            /\ UNCHANGED <<stepStore, cache>>
+    /\ UNCHANGED <<claim, leaseAlive, curStep, computed, readFence>>
 
 \* Read and adopt the winning executor's step result.
 \* This is the "lose gracefully" path: our execution's side effects
@@ -221,6 +257,18 @@ Restart(e) ==
     /\ readFence' = [readFence EXCEPT ![e] = 0]
     /\ UNCHANGED <<claim, leaseAlive, stepStore, crashes>>
 
+\* A completed executor voluntarily releases its claim.
+\* Models the defer releaseClaim() in the Go code. Only releases if
+\* the executor still owns the claim (owner check prevents deleting
+\* another executor's claim after a takeover race).
+ReleaseClaim(e) ==
+    /\ pc[e] = "done"
+    /\ claim # NULL
+    /\ claim.owner = e
+    /\ claim' = NULL
+    /\ leaseAlive' = FALSE
+    /\ UNCHANGED <<stepStore, pc, curStep, computed, cache, readFence, crashes>>
+
 \* ================================================================
 \* Specification
 \* ================================================================
@@ -237,15 +285,34 @@ Next ==
         \/ CheckCache(e)
         \/ ExecStep(e)
         \/ PersistStep(e)
+        \/ PersistStepThenCrash(e)
         \/ AdoptResult(e)
         \/ NextStep(e)
         \/ Crash(e)
         \/ Retry(e)
         \/ Restart(e)
+        \/ ReleaseClaim(e)
     \/ LeaseExpires
     \/ (Terminated /\ UNCHANGED vars)
 
 Spec == Init /\ [][Next]_vars
+
+\* Per-executor progress actions (excludes Crash and PersistStepThenCrash,
+\* which are failure modes that should not be forced by fairness).
+ProgressAction(e) ==
+    \/ TryClaim(e) \/ ReadClaim(e) \/ TakeOver(e) \/ LoadSteps(e)
+    \/ CheckCache(e) \/ ExecStep(e) \/ PersistStep(e)
+    \/ AdoptResult(e) \/ NextStep(e) \/ Retry(e) \/ Restart(e)
+    \/ ReleaseClaim(e)
+
+\* Fair specification for liveness checking. Per-executor weak fairness
+\* ensures each executor eventually makes progress when its actions are
+\* continuously enabled. WF on LeaseExpires ensures expired leases are
+\* eventually detected. Crash and PersistStepThenCrash are excluded:
+\* failures may happen but are not required to.
+FairSpec == Init /\ [][Next]_vars
+    /\ (\A e \in Exec: WF_vars(ProgressAction(e)))
+    /\ WF_vars(LeaseExpires)
 
 \* ================================================================
 \* Safety Invariants
@@ -273,6 +340,13 @@ CompletionIntegrity ==
         pc[e] = "done" =>
             \A i \in Steps: cache[e][i] # NULL
 
+\* The fence token is always positive when a claim exists.
+\* Combined with TakeOver reading claim.fence (not a stale snapshot),
+\* this ensures the fence token is strictly monotonically increasing
+\* across successive claim writes.
+FencePositive ==
+    claim # NULL => claim.fence >= 1
+
 \* Step results in S3, once written, never change.
 \* This is the core fencing property: PutIfAbsent makes step results immutable.
 \* Checked as an action property: in every state transition, non-NULL values
@@ -282,5 +356,22 @@ WriteOnce ==
         stepStore[i] # NULL => stepStore'[i] = stepStore[i]
 
 WriteOnceProperty == [][WriteOnce]_vars
+
+\* The fence token never decreases. CAS-based TakeOver ensures each
+\* successful takeover increments the fence by exactly 1, and concurrent
+\* attempts are serialized by the conditional write.
+FenceMonotonic ==
+    (claim # NULL /\ claim' # NULL) => claim'.fence >= claim.fence
+
+FenceMonotonicProperty == [][FenceMonotonic]_vars
+
+\* ================================================================
+\* Liveness Properties
+\* ================================================================
+
+\* At least one executor eventually completes the workflow.
+\* Requires FairSpec (weak fairness on Next) to prevent trivial
+\* counterexamples where the system simply stops taking steps.
+EventualCompletion == <>(\E e \in Exec: pc[e] = "done")
 
 ====
