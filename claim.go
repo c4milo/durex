@@ -39,13 +39,12 @@ func (e *Executor) claimKey(workflowID string) string {
 // The algorithm:
 //  1. Try atomic create via PutIfAbsent (S3 If-None-Match). If no other holder
 //     exists, we win immediately.
-//  2. If the claim exists, read it. If the lease is still valid, return
-//     ErrWorkflowAlreadyRunning.
-//  3. If the lease is expired, take over by overwriting with a bumped fence
-//     token. A race is possible here (two processes detect expiry simultaneously),
-//     but write-once step results (PutIfAbsent on every step) provide the
-//     correctness backstop: even if two holders proceed, only one can persist
-//     each step result.
+//  2. If the claim exists, read it with its ETag. If the lease is still valid,
+//     return ErrWorkflowAlreadyRunning.
+//  3. If the lease is expired, take over via CAS (S3 If-Match) with a bumped
+//     fence token. The conditional write ensures only one executor can succeed
+//     when multiple detect the same expiry — losers get ErrPreconditionFailed
+//     and retry from step 1.
 func (e *Executor) acquireClaim(ctx context.Context, workflowID string) (int64, error) {
 	ctx, span := tracer.Start(ctx, "durex.workflow.acquire_claim",
 		trace.WithAttributes(
@@ -81,8 +80,8 @@ func (e *Executor) acquireClaim(ctx context.Context, workflowID string) (int64, 
 		return 0, fmt.Errorf("acquiring workflow claim: %w", err)
 	}
 
-	// Claim exists. Read it and check the lease.
-	existingData, err := e.storage.Get(ctx, e.claimKey(workflowID))
+	// Claim exists. Read it with ETag for CAS takeover.
+	existingData, etag, err := e.storage.GetWithETag(ctx, e.claimKey(workflowID))
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -106,14 +105,22 @@ func (e *Executor) acquireClaim(ctx context.Context, workflowID string) (int64, 
 		return 0, err
 	}
 
-	// Lease expired. Take over with a bumped fence token.
+	// Lease expired. CAS takeover with bumped fence token.
+	// If another executor took over between our read and this write,
+	// PutIfMatch fails with ErrPreconditionFailed and we surface it
+	// so the caller can retry.
 	claim.FenceToken = existing.FenceToken + 1
 	data, err = json.Marshal(claim)
 	if err != nil {
 		return 0, err
 	}
 
-	if err := e.storage.Put(ctx, e.claimKey(workflowID), data); err != nil {
+	if err := e.storage.PutIfMatch(ctx, e.claimKey(workflowID), data, etag); err != nil {
+		if errors.Is(err, ErrPreconditionFailed) {
+			// Another executor won the CAS race. Return a retryable error.
+			err = fmt.Errorf("%w: claim was modified during takeover attempt",
+				ErrWorkflowAlreadyRunning)
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return 0, fmt.Errorf("taking over expired claim: %w", err)
@@ -129,9 +136,11 @@ func (e *Executor) acquireClaim(ctx context.Context, workflowID string) (int64, 
 }
 
 // renewClaim extends the lease on an existing claim owned by this executor.
-// Returns false if the claim no longer belongs to us (another executor took over).
+// Uses CAS (PutIfMatch) to avoid overwriting another executor's claim in case
+// of a concurrent takeover between the read and write.
+// Returns false if the claim no longer belongs to us or the CAS fails.
 func (e *Executor) renewClaim(ctx context.Context, workflowID string) bool {
-	data, err := e.storage.Get(ctx, e.claimKey(workflowID))
+	data, etag, err := e.storage.GetWithETag(ctx, e.claimKey(workflowID))
 	if err != nil {
 		return false
 	}
@@ -151,7 +160,7 @@ func (e *Executor) renewClaim(ctx context.Context, workflowID string) bool {
 		return false
 	}
 
-	return e.storage.Put(ctx, e.claimKey(workflowID), renewed) == nil
+	return e.storage.PutIfMatch(ctx, e.claimKey(workflowID), renewed, etag) == nil
 }
 
 // renewLeaseLoop periodically renews the claim lease until ctx is cancelled.

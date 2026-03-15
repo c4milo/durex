@@ -15,6 +15,11 @@ var (
 	// holder's step result.
 	ErrAlreadyExists = errors.New("durex: already exists")
 
+	// ErrPreconditionFailed is returned by PutIfMatch when the object's current
+	// ETag does not match the expected value. This means the object was modified
+	// (or deleted) between the read and the conditional write.
+	ErrPreconditionFailed = errors.New("durex: precondition failed")
+
 	// ErrWorkflowAlreadyRunning is returned when attempting to run a workflow
 	// that is currently claimed by another executor.
 	ErrWorkflowAlreadyRunning = errors.New("durex: workflow already running")

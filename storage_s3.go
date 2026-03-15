@@ -84,6 +84,53 @@ func (s *S3Storage) PutIfAbsent(ctx context.Context, key string, data []byte) er
 	return nil
 }
 
+func (s *S3Storage) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil, "", ErrNotFound
+		}
+		return nil, "", err
+	}
+	defer out.Body.Close()
+	limited := io.LimitReader(out.Body, s.maxObjectSize+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, "", err
+	}
+	if int64(len(data)) > s.maxObjectSize {
+		return nil, "", fmt.Errorf("object %q exceeds maximum size (%d bytes)", key, s.maxObjectSize)
+	}
+	etag := ""
+	if out.ETag != nil {
+		etag = *out.ETag
+	}
+	return data, etag, nil
+}
+
+func (s *S3Storage) PutIfMatch(ctx context.Context, key string, data []byte, etag string) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:  &s.bucket,
+		Key:     &key,
+		Body:    bytes.NewReader(data),
+		IfMatch: &etag,
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "ConditionalRequestConflict", "PreconditionFailed":
+				return ErrPreconditionFailed
+			}
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *S3Storage) Get(ctx context.Context, key string) ([]byte, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.bucket,
