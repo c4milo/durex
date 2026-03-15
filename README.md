@@ -76,6 +76,15 @@ Executor A                     S3                      Executor B
 The storage itself enforces the fence, not the lock. This is the key insight
 from Kleppmann: a lock alone is never sufficient.
 
+### CAS-based claim takeover
+
+When a lease expires, executors compete to take over using S3 conditional writes
+(`If-Match: <etag>`). This is a compare-and-swap (CAS) operation: the executor
+reads the claim with its ETag, bumps the fence token, and writes back only if
+the ETag still matches. If two executors detect the same expiry, exactly one
+wins -- the loser sees a 412 Precondition Failed and retries. This guarantees
+strict fence token monotonicity.
+
 ### Recovery
 
 Failed steps are not persisted. On re-execution with the same workflow ID:
@@ -188,10 +197,17 @@ durex.S3Config{
 ## Formal verification
 
 The distributed locking protocol is specified in TLA+ (`tla/DurexLock.tla`)
-and verified with the TLC model checker across 2.9 billion states (714 million
+and verified with the TLC model checker across 1.4 billion states (348 million
 distinct) with no violations. The model explores all interleavings of N
 executors competing to run a workflow with K steps, including lease expiry,
-process crashes, retries, and restarts.
+CAS-based claim takeover, process crashes, ambiguous writes (server-side
+success + client-side crash), voluntary claim release, retries, and restarts.
+
+Properties verified:
+- **ResultConsistency** -- all completing executors agree on step results
+- **WriteOnceProperty** -- step results in S3 never change once written
+- **FenceMonotonicProperty** -- fence token never decreases across takeovers
+- **EventualCompletion** -- at least one executor eventually completes (liveness)
 
 ## Development
 
